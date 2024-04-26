@@ -42,6 +42,10 @@ app.post('/api/dbase/query', (req, res) => {
     });
 });
 
+app.get('/test', (req, res) => {
+    res.status(200).send('OK');
+});
+
 const PORT = 3061;
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);

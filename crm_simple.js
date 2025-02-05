@@ -11,7 +11,7 @@ app.use(bodyParser.json());
 // Константы для подключения к базе данных
 
 app.post('/api/dbase/query', (req, res) => {
-    
+
     const { type, token, sql, params, client__db_host, client__db_port, client__db_path } = req.body;
     const options = {
         host: client__db_host, // или ваш хост
@@ -25,7 +25,7 @@ app.post('/api/dbase/query', (req, res) => {
         blobAsText: true
     };
     console.log(sql);
-    Firebird.attach(options, function(err, db) {
+    Firebird.attach(options, function (err, db) {
         if (err) {
             return res.status(500).send({ error: 'Database connection failed' });
         }
@@ -35,7 +35,7 @@ app.post('/api/dbase/query', (req, res) => {
         db.queryAsync(sql, params || [])
             .then(result => {
                 db.detach();
-                if (result) {res.status(200).json(result)} else {res.status(200).json([])}
+                if (result) { res.status(200).json(result) } else { res.status(200).json([]) }
             })
             .catch(error => {
                 db.detach();
@@ -103,8 +103,8 @@ app.post('/api/generate-pdf', (req, res) => {
 
         // Опционально: можно добавить проверку корректности Base64 строки
         if (!/^[a-zA-Z0-9/+=]+$/.test(pdfBase64)) {
-             console.error('Invalid Base64 string received from Delphi process.');
-             return res.status(500).json({ error: 'Invalid Base64 string received from PDF generator.' });
+            console.error('Invalid Base64 string received from Delphi process.');
+            return res.status(500).json({ error: 'Invalid Base64 string received from PDF generator.' });
         }
 
         res.status(200).json({ pdf: pdfBase64 });
@@ -114,6 +114,57 @@ app.post('/api/generate-pdf', (req, res) => {
     delphiProcess.on('error', (err) => {
         console.error('Failed to start Delphi process:', err);
         res.status(500).json({ error: 'Failed to start PDF generator.', details: err.message });
+    });
+});
+
+app.post('/api/dbase/get-file', (req, res) => {
+    const { token, fileId, client__db_host, client__db_port, client__db_path } = req.body;
+
+    // Параметр blobAsText устанавливаем в false, чтобы получать бинарные данные.
+    const options = {
+        host: client__db_host,
+        port: client__db_port,
+        database: client__db_path,
+        user: 'SYSDBA',
+        password: 'masterkey',
+        lowercase_keys: true,  // поля будут возвращаться в нижнем регистре: file_name, file_body
+        role: null,
+        pageSize: 4096,
+        blobAsText: false
+    };
+
+    console.log(`Получаем файл с ID=${fileId} из базы ${client__db_path}`);
+    Firebird.attach(options, (err, db) => {
+        if (err) {
+            console.error("Ошибка подключения к базе:", err);
+            return res.status(500).json({ error: 'Database connection failed', details: err.message });
+        }
+
+        // Запрос выбирает только FILE_NAME и FILE_BODY
+        const sql = "SELECT FILE_NAME, FILE_BODY FROM FILES WHERE ID = ?";
+        db.query(sql, [fileId], (err, result) => {
+            if (err) {
+                db.detach();
+                console.error("Ошибка выполнения запроса:", err);
+                return res.status(500).json({ error: 'Query execution failed', details: err.message });
+            }
+            if (!result || result.length === 0) {
+                db.detach();
+                return res.status(404).json({ error: 'File not found' });
+            }
+
+            const fileRecord = result[0];
+            // При использовании lowercase_keys получаем имена столбцов в нижнем регистре
+            const fileName = fileRecord.file_name;
+            const fileData = fileRecord.file_body; // FILE_BODY – BLOB с бинарными данными
+
+            db.detach();
+            // Устанавливаем заголовки для отдачи файла
+            res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+            res.setHeader('Content-Type', 'application/octet-stream');
+            // Отдаем бинарные данные файла
+            res.send(fileData);
+        });
     });
 });
 

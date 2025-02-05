@@ -119,54 +119,85 @@ app.post('/api/generate-pdf', (req, res) => {
 
 app.post('/api/dbase/get-file', (req, res) => {
     const { token, fileId, client__db_host, client__db_port, client__db_path } = req.body;
-
-    // Параметр blobAsText устанавливаем в false, чтобы получать бинарные данные.
+  
+    // Здесь можно добавить проверку token, если требуется
+  
+    // Настраиваем подключение к Firebird с опцией blobAsText: false
     const options = {
-        host: client__db_host,
-        port: client__db_port,
-        database: client__db_path,
-        user: 'SYSDBA',
-        password: 'masterkey',
-        lowercase_keys: true,  // поля будут возвращаться в нижнем регистре: file_name, file_body
-        role: null,
-        pageSize: 4096,
-        blobAsText: false
+      host: client__db_host,
+      port: client__db_port,
+      database: client__db_path,
+      user: 'SYSDBA',
+      password: 'masterkey',
+      lowercase_keys: true, // поля будут в нижнем регистре: file_name, file_body
+      role: null,
+      pageSize: 4096,
+      blobAsText: false
     };
-
+  
     console.log(`Получаем файл с ID=${fileId} из базы ${client__db_path}`);
     Firebird.attach(options, (err, db) => {
+      if (err) {
+        console.error("Ошибка подключения к базе:", err);
+        return res.status(500).json({ error: 'Database connection failed', details: err.message });
+      }
+  
+      // Выполняем запрос: выбираем FILE_NAME и FILE_BODY
+      const sql = "SELECT FILE_NAME, FILE_BODY FROM FILES WHERE ID = ?";
+      db.query(sql, [fileId], (err, result) => {
         if (err) {
-            console.error("Ошибка подключения к базе:", err);
-            return res.status(500).json({ error: 'Database connection failed', details: err.message });
+          db.detach();
+          console.error("Ошибка выполнения запроса:", err);
+          return res.status(500).json({ error: 'Query execution failed', details: err.message });
         }
-
-        // Запрос выбирает только FILE_NAME и FILE_BODY
-        const sql = "SELECT FILE_NAME, FILE_BODY FROM FILES WHERE ID = ?";
-        db.query(sql, [fileId], (err, result) => {
-            if (err) {
-                db.detach();
-                console.error("Ошибка выполнения запроса:", err);
-                return res.status(500).json({ error: 'Query execution failed', details: err.message });
+        if (!result || result.length === 0) {
+          db.detach();
+          return res.status(404).json({ error: 'File not found' });
+        }
+  
+        const fileRecord = result[0];
+        const fileName = fileRecord.file_name;
+        const fileBody = fileRecord.file_body; // FILE_BODY может быть функцией
+  
+        // Если fileBody является функцией, читаем BLOB асинхронно
+        if (typeof fileBody === 'function') {
+          fileBody(function (blobErr, blobName, blobStream) {
+            if (blobErr) {
+              db.detach();
+              console.error("Ошибка чтения BLOB:", blobErr);
+              return res.status(500).json({ error: 'Error reading BLOB', details: blobErr.message });
             }
-            if (!result || result.length === 0) {
-                db.detach();
-                return res.status(404).json({ error: 'File not found' });
-            }
-
-            const fileRecord = result[0];
-            // При использовании lowercase_keys получаем имена столбцов в нижнем регистре
-            const fileName = fileRecord.file_name;
-            const fileData = fileRecord.file_body; // FILE_BODY – BLOB с бинарными данными
-
-            db.detach();
-            // Устанавливаем заголовки для отдачи файла
-            res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
-            res.setHeader('Content-Type', 'application/octet-stream');
-            // Отдаем бинарные данные файла
-            res.send(fileData);
-        });
+  
+            let chunks = [];
+            // Событие data – получаем куски данных
+            blobStream.on('data', function (chunk) {
+              chunks.push(chunk);
+            });
+            // Событие end – данные полностью прочитаны
+            blobStream.on('end', function () {
+              const blobData = Buffer.concat(chunks);
+              db.detach();
+              res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+              res.setHeader('Content-Type', 'application/octet-stream');
+              res.send(blobData);
+            });
+            // Обработка ошибок потока
+            blobStream.on('error', function (streamErr) {
+              db.detach();
+              console.error("Ошибка в потоке BLOB:", streamErr);
+              return res.status(500).json({ error: 'Error in BLOB stream', details: streamErr.message });
+            });
+          });
+        } else {
+          // Если fileBody уже является Buffer или другим типом, отправляем напрямую
+          db.detach();
+          res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+          res.setHeader('Content-Type', 'application/octet-stream');
+          res.send(fileBody);
+        }
+      });
     });
-});
+  });
 
 app.get('/test', (req, res) => {
     res.status(200).send('OK');

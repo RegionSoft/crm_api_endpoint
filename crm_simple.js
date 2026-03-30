@@ -1,23 +1,37 @@
+// CRM Simple Endpoint - простой сервер для работы с Firebird
+// Этот сервер предоставляет API для работы с Firebird, включая выполнение SQL-запросов и генерацию PDF-отчетов.
+// Также реализована система загрузки файлов с использованием UploadJobManager
+
 const express = require('express');
 const bodyParser = require('body-parser');
 const Firebird = require('node-firebird');
 const Promise = require('bluebird');
 const { spawn } = require('child_process');
 const path = require('path');
+const fs = require('fs');
+const UploadJobManager = require('./upload_job_manager'); // Импортируем UploadJobManager
+const WSClient = require('./ws_client'); // WebSocket клиент для подключения к crm_api
 
 const app = express();
 app.use(bodyParser.json());
+
+let uploadJobManager = null;
+
+async function initializeFileUploadSystem() {
+  try {
+    uploadJobManager = new UploadJobManager();
+    await uploadJobManager.initialize();
+    uploadJobManager.startPolling();
+    console.log('File upload system initialized successfully');
+  } catch (error) {
+    console.error('Failed to initialize file upload system:', error);
+  }
+}
 
 /**
  * Получает конфигурацию хранения (storageLocation и storageCatalog) из таблицы PARAM в Firebird.
  * @param {Object} options - объект с параметрами подключения к Firebird (host, port, database, user, password, и т.п.)
  * @returns {Promise<Object>} - промис, который резолвится объектом вида { storageLocation, storageCatalog }
- */
-/**
- * Функция для получения конфигурации хранения из Firebird.
- * Из таблицы PARAM извлекаются два параметра:
- *   - FILESTORAGELOCATION – целое число (1 – СУБД, 2 – Catalog)
- *   - FILESTORAGECATALOG – корневой каталог для хранения файлов (если режим = 2)
  */
 function getStorageConfigFromFirebird(options) {
   return new Promise((resolve, reject) => {
@@ -28,21 +42,26 @@ function getStorageConfigFromFirebird(options) {
       const sql = "SELECT PARAM, VAL FROM PARAM WHERE UPPER(TRIM(PARAM)) IN ('FILESTORAGELOCATION','FILESTORAGECATALOG')";
       db.query(sql, (err, result) => {
         if (err) {
+          console.error("Ошибка выполнения запроса:", err);
           db.detach();
           return reject(err);
         }
         // Значения по умолчанию:
         let config = { storageLocation: 1, storageCatalog: '' };
-        result.forEach(row => {
-          const key = String(row.PARAM).trim().toUpperCase();
-          if (key === 'FILESTORAGELOCATION') {
-            // Преобразуем в целое число; если преобразование не удалось – оставляем 1
-            const val = parseInt(String(row.VAL).trim(), 10);
-            config.storageLocation = isNaN(val) ? 1 : val;
-          } else if (key === 'FILESTORAGECATALOG') {
-            config.storageCatalog = String(row.VAL).trim();
-          }
-        });
+        
+/*         if (result && result.length > 0) {
+          result.forEach(row => {
+            const key = String(row.param).trim().toUpperCase();
+            if (key === 'FILESTORAGELOCATION') {
+              // Преобразуем в целое число; если преобразование не удалось – оставляем 1
+              const val = parseInt(String(row.val).trim(), 10);
+              config.storageLocation = isNaN(val) ? 1 : val;
+            } else if (key === 'FILESTORAGECATALOG') {
+              config.storageCatalog = String(row.val).trim();
+            }
+          });
+        } */
+        
         db.detach();
         resolve(config);
       });
@@ -50,9 +69,10 @@ function getStorageConfigFromFirebird(options) {
   });
 }
 
+// Основной API endpoint для выполнения SQL запросов
 app.post('/api/dbase/query', (req, res) => {
-
   const { type, token, sql, params, client__db_host, client__db_port, client__db_path } = req.body;
+  
   const options = {
     host: client__db_host, // или ваш хост
     port: client__db_port,        // или ваш порт
@@ -64,10 +84,13 @@ app.post('/api/dbase/query', (req, res) => {
     pageSize: 4096,       // размер страницы для базы данных
     blobAsText: true
   };
-  console.log(sql);
+  
+  console.log('Executing SQL:', sql);
+  
   Firebird.attach(options, function (err, db) {
     if (err) {
-      return res.status(500).send({ error: 'Database connection failed' });
+      console.error('Database connection failed:', err);
+      return res.status(500).send({ error: 'Database connection failed', details: err.message });
     }
 
     Promise.promisifyAll(db);
@@ -75,10 +98,15 @@ app.post('/api/dbase/query', (req, res) => {
     db.queryAsync(sql, params || [])
       .then(result => {
         db.detach();
-        if (result) { res.status(200).json(result) } else { res.status(200).json([]) }
+        if (result) { 
+          res.status(200).json(result);
+        } else { 
+          res.status(200).json([]);
+        }
       })
       .catch(error => {
         db.detach();
+        console.error('Query execution failed:', error);
         res.status(500).json({ error: 'Query execution failed', details: error.message });
       });
   });
@@ -90,6 +118,7 @@ app.post('/api/generate-pdf', (req, res) => {
 
   // Путь к базе данных
   const dbPath = client__db_host + '/' + client__db_port + ':' + client__db_path;
+  
   // Валидация входных параметров
   if (!dbPath || !reportName || !id) {
     return res.status(400).json({ error: 'Missing parameters: dbPath, reportName, id are required.' });
@@ -99,7 +128,6 @@ app.post('/api/generate-pdf', (req, res) => {
   const delphiExePath = path.join(__dirname, 'genpdf.exe'); // Убедитесь, что genpdf.exe находится в той же директории
 
   // Проверка существования Delphi-программы
-  const fs = require('fs');
   if (!fs.existsSync(delphiExePath)) {
     return res.status(500).json({ error: 'PDF generator not found on server.' });
   }
@@ -158,24 +186,12 @@ app.post('/api/generate-pdf', (req, res) => {
 });
 
 /**
- * Endpoint для получения файла.
- *
- * Ожидается, что в теле запроса передаются:
- *   - token
- *   - fileId — идентификатор файла (из таблицы FILES)
- *   - client__db_host, client__db_port, client__db_path — параметры подключения к Firebird
- *
- * В каталожном режиме (storageLocation === 2) остальные данные извлекаются из таблицы FILES:
- *   CUSTNO и FILE_NAME используются для формирования пути к физическому файлу:
- *
- *     {storageCatalog}/FILES/{CUSTNO}/{fileId}_{FILE_NAME}
- *
- * Если storageLocation === 1, файл извлекается из БЛОБа (FILE_BODY).
+ * Endpoint для получения файла из Firebird
  */
 app.post('/api/dbase/get-file', async (req, res) => {
   const { token, fileId, client__db_host, client__db_port, client__db_path } = req.body;
 
-  // Параметры подключения к Firebird (используем их и для получения конфигурации, и для извлечения файла)
+  // Параметры подключения к Firebird
   const fbOptions = {
     host: client__db_host,
     port: client__db_port,
@@ -188,127 +204,242 @@ app.post('/api/dbase/get-file', async (req, res) => {
     blobAsText: false
   };
 
-  let storageConfig;
   try {
-    storageConfig = await getStorageConfigFromFirebird(fbOptions);
-  } catch (err) {
-    console.error("Ошибка получения конфигурации хранения из Firebird:", err);
-    return res.status(500).json({ error: 'Error retrieving storage config', details: err.message });
-  }
+    // Получаем конфигурацию хранения
+    const storageConfig = await getStorageConfigFromFirebird(fbOptions);
+    console.log("Storage config:", storageConfig);
 
-  const { storageLocation, storageCatalog } = storageConfig;
-  console.log("Полученная конфигурация хранения:", storageConfig);
-
-  if (storageLocation === 2) {
-    // Режим "catalog": извлекаем данные о файле (FILE_NAME, CUSTNO) из таблицы FILES
-    Firebird.attach(fbOptions, (err, db) => {
-      if (err) {
-        console.error("Ошибка подключения к базе:", err);
-        return res.status(500).json({ error: 'Database connection failed', details: err.message });
-      }
-      const sql = "SELECT FILE_NAME, CUSTNO FROM FILES WHERE ID = ?";
-      db.query(sql, [fileId], (err, result) => {
+    if (storageConfig.storageLocation === 2 && storageConfig.storageCatalog) {
+      // Режим "catalog": извлекаем данные о файле из таблицы FILES
+      Firebird.attach(fbOptions, (err, db) => {
         if (err) {
-          db.detach();
-          console.error("Ошибка выполнения запроса:", err);
-          return res.status(500).json({ error: 'Query execution failed', details: err.message });
+          console.error("Database connection failed:", err);
+          return res.status(500).json({ error: 'Database connection failed', details: err.message });
         }
-        if (!result || result.length === 0) {
-          db.detach();
-          return res.status(404).json({ error: 'File not found in database' });
-        }
-        const fileRecord = result[0];
-        const dbFileName = fileRecord.file_name;
-        const custNo = fileRecord.custno;
-        db.detach();
-
-        // Формируем путь к файлу:
-        // {storageCatalog}/FILES/{custNo}/{fileId}_{dbFileName}
-        const sourcePath = path.join(
-          storageCatalog,
-          "FILES",
-          String(custNo),
-          `${fileId}_${dbFileName}`
-        );
-        console.log(`Catalog mode: копирование файла из ${sourcePath}`);
-        fs.access(sourcePath, fs.constants.R_OK, (err) => {
+        
+        const sql = "SELECT FILE_NAME, CUSTNO FROM FILES WHERE ID = ?";
+        db.query(sql, [fileId], (err, result) => {
           if (err) {
-            console.error("Файл не найден в каталоге:", err);
-            return res.status(404).json({ error: 'File not found in catalog', details: err.message });
+            db.detach();
+            console.error("Query execution failed:", err);
+            return res.status(500).json({ error: 'Query execution failed', details: err.message });
           }
-          res.setHeader('Content-Disposition', `attachment; filename="${dbFileName}"`);
-          res.setHeader('Content-Type', 'application/octet-stream');
-          const readStream = fs.createReadStream(sourcePath);
-          readStream.on('error', (streamErr) => {
-            console.error("Ошибка чтения файла из каталога:", streamErr);
-            res.status(500).json({ error: 'Error reading file from catalog', details: streamErr.message });
+          
+          if (!result || result.length === 0) {
+            db.detach();
+            return res.status(404).json({ error: 'File not found in database' });
+          }
+          
+          const fileRecord = result[0];
+          const dbFileName = fileRecord.file_name;
+          const custNo = fileRecord.custno;
+          db.detach();
+
+          // Формируем путь к файлу в каталоге
+          const sourcePath = path.join(
+            storageConfig.storageCatalog,
+            "FILES",
+            String(custNo),
+            `${fileId}_${dbFileName}`
+          );
+          
+          console.log(`Catalog mode: reading file from ${sourcePath}`);
+          
+          fs.access(sourcePath, fs.constants.R_OK, (err) => {
+            if (err) {
+              console.error("File not found in catalog:", err);
+              return res.status(404).json({ error: 'File not found in catalog', details: err.message });
+            }
+            
+            res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(dbFileName)}`);
+            res.setHeader('Content-Type', 'application/octet-stream');
+            
+            const readStream = fs.createReadStream(sourcePath);
+            readStream.on('error', (streamErr) => {
+              console.error("Error reading file from catalog:", streamErr);
+              res.status(500).json({ error: 'Error reading file from catalog', details: streamErr.message });
+            });
+            readStream.pipe(res);
           });
-          readStream.pipe(res);
         });
       });
-    });
-  } else {
-    // Режим "database": извлекаем файл из Firebird (BLOB)
-    console.log(`Database mode: Получаем файл с ID=${fileId} из базы ${client__db_path}`);
-    Firebird.attach(fbOptions, (err, db) => {
-      if (err) {
-        console.error("Ошибка подключения к базе:", err);
-        return res.status(500).json({ error: 'Database connection failed', details: err.message });
-      }
-      const sql = "SELECT FILE_NAME, FILE_BODY FROM FILES WHERE ID = ?";
-      db.query(sql, [fileId], (err, result) => {
+    } else {
+      // Режим "database": извлекаем файл из BLOB
+      console.log(`Database mode: getting file with ID=${fileId} from database ${client__db_path}`);
+      
+      Firebird.attach(fbOptions, (err, db) => {
         if (err) {
-          db.detach();
-          console.error("Ошибка выполнения запроса:", err);
-          return res.status(500).json({ error: 'Query execution failed', details: err.message });
+          console.error("Database connection failed:", err);
+          return res.status(500).json({ error: 'Database connection failed', details: err.message });
         }
-        if (!result || result.length === 0) {
-          db.detach();
-          return res.status(404).json({ error: 'File not found in database' });
-        }
+        
+        const sql = "SELECT FILE_NAME, FILE_BODY FROM FILES WHERE ID = ?";
+        db.query(sql, [fileId], (err, result) => {
+          if (err) {
+            db.detach();
+            console.error("Query execution failed:", err);
+            return res.status(500).json({ error: 'Query execution failed', details: err.message });
+          }
+          
+          if (!result || result.length === 0) {
+            db.detach();
+            return res.status(404).json({ error: 'File not found in database' });
+          }
 
-        const fileRecord = result[0];
-        const dbFileName = fileRecord.file_name;
-        const fileBody = fileRecord.file_body;
+          const fileRecord = result[0];
+          const fileName = fileRecord.file_name;
+          const fileBody = fileRecord.file_body;
 
-        if (typeof fileBody === 'function') {
-          fileBody((blobErr, blobName, blobStream) => {
-            if (blobErr) {
-              db.detach();
-              console.error("Ошибка чтения BLOB:", blobErr);
-              return res.status(500).json({ error: 'Error reading BLOB', details: blobErr.message });
-            }
-            let chunks = [];
-            blobStream.on('data', (chunk) => { chunks.push(chunk); });
-            blobStream.on('end', () => {
-              const blobData = Buffer.concat(chunks);
-              db.detach();
-              res.setHeader('Content-Disposition', `attachment; filename="${dbFileName}"`);
-              res.setHeader('Content-Type', 'application/octet-stream');
-              res.send(blobData);
+          // Если fileBody является функцией, читаем BLOB асинхронно
+          if (typeof fileBody === 'function') {
+            fileBody(function (blobErr, blobName, blobStream) {
+              if (blobErr) {
+                db.detach();
+                console.error("Error reading BLOB:", blobErr);
+                return res.status(500).json({ error: 'Error reading BLOB', details: blobErr.message });
+              }
+
+              let chunks = [];
+              blobStream.on('data', function (chunk) {
+                chunks.push(chunk);
+              });
+              
+              blobStream.on('end', function () {
+                const blobData = Buffer.concat(chunks);
+                db.detach();
+                res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(fileName)}`);
+                res.setHeader('Content-Type', 'application/octet-stream');
+                res.send(blobData);
+              });
+              
+              blobStream.on('error', function (streamErr) {
+                db.detach();
+                console.error("Error in BLOB stream:", streamErr);
+                return res.status(500).json({ error: 'Error in BLOB stream', details: streamErr.message });
+              });
             });
-            blobStream.on('error', (streamErr) => {
-              db.detach();
-              console.error("Ошибка в потоке BLOB:", streamErr);
-              return res.status(500).json({ error: 'Error in BLOB stream', details: streamErr.message });
-            });
-          });
-        } else {
-          db.detach();
-          res.setHeader('Content-Disposition', `attachment; filename="${dbFileName}"`);
-          res.setHeader('Content-Type', 'application/octet-stream');
-          res.send(fileBody);
-        }
+          } else {
+            // Если fileBody уже является Buffer или другим типом, отправляем напрямую
+            db.detach();
+            res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(fileName)}`);
+            res.setHeader('Content-Type', 'application/octet-stream');
+            res.send(fileBody);
+          }
+        });
       });
-    });
+    }
+  } catch (error) {
+    console.error("Error getting storage config:", error);
+    return res.status(500).json({ error: 'Error getting storage config', details: error.message });
   }
 });
 
+/**
+ * Инициализация WebSocket-подключений к crm_api серверу.
+ * apikey и secretkey берутся из реестра Windows (как в UploadJobManager).
+ * WS_SERVER_URL берётся из env (по умолчанию wss://crmapi.regionsoft.ru/ws/endpoint).
+ * Для каждой пары apikey/secretkey в реестре создаётся отдельное WS-соединение.
+ */
+const wsClients = [];
+
+async function initializeWSClient() {
+  const serverUrl = process.env.WS_SERVER_URL || 'wss://crmapi.regionsoft.ru/ws/endpoint';
+
+  let Registry;
+  try {
+    Registry = require('winreg');
+  } catch (e) {
+    console.log('[WS] winreg not available (not Windows?) — skipping WS client init');
+    return;
+  }
+
+  try {
+    // Читаем apikeys из реестра
+    const apikeyReg = new Registry({
+      hive: Registry.HKLM,
+      key: '\\SOFTWARE\\RegionSoft\\CRM_API\\apikeys'
+    });
+
+    const apikeys = await new Promise((resolve, reject) => {
+      apikeyReg.values((err, items) => {
+        if (err) reject(err);
+        else resolve(items);
+      });
+    });
+
+    console.log(`[WS] Found ${apikeys.length} API keys in registry`);
+
+    for (const item of apikeys) {
+      try {
+        const id = item.name;
+        const apikey = item.value;
+
+        // Получаем secretkey для этого id
+        const secretkeyReg = new Registry({
+          hive: Registry.HKLM,
+          key: '\\SOFTWARE\\RegionSoft\\CRM_API\\secretkeys'
+        });
+
+        const secretkey = await new Promise((resolve, reject) => {
+          secretkeyReg.get(id, (err, regItem) => {
+            if (err) reject(err);
+            else resolve(regItem.value);
+          });
+        });
+
+        if (!secretkey) {
+          console.error(`[WS] No secret key for ${id}, skipping`);
+          continue;
+        }
+
+        const client = new WSClient({
+          serverUrl,
+          apikey,
+          secretkey,
+          localPort: PORT
+        });
+
+        client.connect();
+        wsClients.push(client);
+        console.log(`[WS] Client initialized for key ${id}, connecting to ${serverUrl}`);
+      } catch (err) {
+        console.error(`[WS] Failed to init client for key ${item.name}:`, err.message);
+      }
+    }
+  } catch (err) {
+    console.error('[WS] Failed to read registry:', err.message);
+  }
+}
+
+// Тестовый endpoint
 app.get('/test', (req, res) => {
   res.status(200).send('OK');
 });
 
 const PORT = 3061;
 app.listen(PORT, () => {
+  initializeFileUploadSystem().catch(error => {
+    console.error('Error initializing file upload system:', error);
+  });
+
+  // Запускаем WS-клиент для подключения к crm_api (если настроен)
+  initializeWSClient();
+
   console.log(`Server running on port ${PORT}`);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down gracefully...');
+
+  // Stop the upload job manager
+  if (uploadJobManager) {
+    uploadJobManager.stopPolling();
+  }
+
+  // Отключаем все WS-клиенты
+  for (const client of wsClients) {
+    client.disconnect();
+  }
+
+  process.exit(0);
 });
